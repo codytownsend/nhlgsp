@@ -2,10 +2,14 @@ import sqlite3
 import json
 import logging
 import argparse
+import os
 from datetime import datetime, timedelta
 from nhl_data_collector import NHLDataCollector
 from goal_scorer_model import GoalScorerModel
 from database import create_database, get_connection
+from config import (
+    DATABASE_PATH, DEFAULT_LOOKBACK_DAYS, DEFAULT_PREDICTION_DAYS
+)
 
 # Set up logging
 logging.basicConfig(
@@ -21,7 +25,18 @@ logger = logging.getLogger(__name__)
 def initialize_system():
     """Initialize the system - create database and tables"""
     logger.info("Initializing NHL prediction system")
+    
+    # Check if database already exists
+    db_exists = os.path.exists(DATABASE_PATH)
+    
+    # Create or connect to the database
     conn = create_database()
+    
+    if not db_exists:
+        logger.info("First-time setup: Database created")
+    else:
+        logger.info("Database already exists")
+        
     return conn
 
 def update_data(conn, start_date=None, end_date=None):
@@ -30,7 +45,7 @@ def update_data(conn, start_date=None, end_date=None):
     
     # Set date range if not provided
     if start_date is None:
-        start_date = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=DEFAULT_LOOKBACK_DAYS)).strftime('%Y-%m-%d')
     if end_date is None:
         end_date = datetime.now().strftime('%Y-%m-%d')
     
@@ -47,11 +62,18 @@ def update_data(conn, start_date=None, end_date=None):
     
     return True
 
-def train_model(conn):
+def train_model(conn, force_retrain=False):
     """Train the goal scorer prediction model"""
     logger.info("Training goal scorer model")
     model = GoalScorerModel(conn)
-    success = model.train()
+    
+    # Check if model exists
+    model_path = os.path.join('models', 'goal_scorer_model.joblib')
+    if os.path.exists(model_path) and not force_retrain:
+        logger.info("Model exists. Use --force-retrain to train a new model.")
+        return model
+    
+    success = model.train(force_retrain=force_retrain)
     
     if success:
         logger.info("Model training completed successfully")
@@ -69,7 +91,7 @@ def make_predictions(conn, start_date=None, end_date=None):
     if start_date is None:
         start_date = datetime.now().strftime('%Y-%m-%d')
     if end_date is None:
-        end_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+        end_date = (datetime.now() + timedelta(days=DEFAULT_PREDICTION_DAYS)).strftime('%Y-%m-%d')
     
     logger.info(f"Making predictions for games from {start_date} to {end_date}")
     
@@ -122,9 +144,14 @@ def export_predictions_to_json(predictions, filename=None):
         logger.warning("No predictions to export")
         return False
     
+    # Create output directory if it doesn't exist
+    output_dir = 'output'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
     if filename is None:
         now = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"predictions_{now}.json"
+        filename = os.path.join(output_dir, f"predictions_{now}.json")
     
     try:
         # Convert to serializable format
@@ -197,7 +224,7 @@ def evaluate_predictions(conn, days_ago=1):
         for game_id, home_team, away_team in games:
             # Get top 10 predictions for this game
             cursor.execute(
-                "SELECT p.player_id, pl.name, pr.goal_probability, pr.scored "
+                "SELECT pr.player_id, pl.name, pr.goal_probability, pr.scored "
                 "FROM predictions pr "
                 "JOIN players pl ON pr.player_id = pl.player_id "
                 "WHERE pr.game_id = ? "
@@ -235,28 +262,18 @@ def evaluate_predictions(conn, days_ago=1):
             overall_total += len(predictions)
         
         if overall_total > 0:
-            print(f"\nOverall accuracy: {overall_correct}/{overall_total} ({overall_correct/overall_total*100:.1f}%)")
+            accuracy = overall_correct/overall_total * 100
+            print(f"\nOverall accuracy: {overall_correct}/{overall_total} ({accuracy:.1f}%)")
         
-        # Store evaluation metrics
-        cursor.execute(
-            "CREATE TABLE IF NOT EXISTS prediction_evaluation ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "evaluation_date TIMESTAMP, "
-            "target_date DATE, "
-            "correct_predictions INTEGER, "
-            "total_predictions INTEGER, "
-            "accuracy REAL)"
-        )
-        
-        cursor.execute(
-            "INSERT INTO prediction_evaluation "
-            "(evaluation_date, target_date, correct_predictions, total_predictions, accuracy) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (datetime.now(), target_date, overall_correct, overall_total, 
-             overall_correct/overall_total if overall_total > 0 else 0)
-        )
-        
-        conn.commit()
+            # Store evaluation metrics
+            cursor.execute(
+                "INSERT INTO prediction_evaluation "
+                "(evaluation_date, target_date, correct_predictions, total_predictions, accuracy) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (datetime.now(), target_date, overall_correct, overall_total, accuracy/100)
+            )
+            
+            conn.commit()
         
     except Exception as e:
         logger.error(f"Error evaluating predictions: {e}")
@@ -266,6 +283,7 @@ def main():
     parser = argparse.ArgumentParser(description='NHL Goal Scorer Prediction System')
     parser.add_argument('--update', action='store_true', help='Update data from NHL API')
     parser.add_argument('--train', action='store_true', help='Train the prediction model')
+    parser.add_argument('--force-retrain', action='store_true', help='Force retrain even if model exists')
     parser.add_argument('--predict', action='store_true', help='Make predictions for upcoming games')
     parser.add_argument('--evaluate', action='store_true', help='Evaluate predictions from previous days')
     parser.add_argument('--start-date', type=str, help='Start date (YYYY-MM-DD)')
@@ -291,7 +309,7 @@ def main():
         
         # Train model
         if args.train:
-            train_model(conn)
+            train_model(conn, args.force_retrain)
         
         # Make predictions
         if args.predict:
