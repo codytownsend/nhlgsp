@@ -6,7 +6,8 @@ Configuration settings for the NHL Goal Scorer Prediction System
 DATABASE_PATH = 'nhl_predictions.db'
 
 # API configuration
-NHL_API_BASE_URL = 'https://statsapi.web.nhl.com/api/v1'
+NHL_WEB_API_BASE_URL = 'https://api-web.nhle.com/v1'
+NHL_STATS_API_BASE_URL = 'https://api.nhle.com/stats/rest/en'
 API_REQUEST_TIMEOUT = 10  # seconds
 API_MAX_RETRIES = 3
 API_RETRY_DELAY = 5  # seconds

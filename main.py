@@ -39,6 +39,58 @@ def initialize_system():
         
     return conn
 
+def update_historical_data(conn, season="20222023"):
+    """Update historical data from a specific NHL season"""
+    collector = NHLDataCollector(conn)
+    
+    # Set date range for the 2022-2023 NHL regular season
+    start_date = "2022-10-07"  # Start of 2022-2023 season
+    end_date = "2023-04-13"    # End of 2022-2023 regular season
+    
+    logger.info(f"Updating historical data from {start_date} to {end_date} (Season: {season})")
+    
+    # Update teams first
+    logger.info("Updating teams...")
+    collector.update_teams()
+    
+    # Process a very short initial period for testing (just one day)
+    test_start = "2022-10-07"
+    test_end = "2022-10-07"
+    
+    logger.info(f"Processing test day: {test_start}")
+    games_processed = collector.process_completed_games(test_start, test_end)
+    
+    if games_processed > 0:
+        logger.info(f"Successfully processed {games_processed} games on test day!")
+        
+        # If successful, process the rest in 3-day chunks
+        start_date_obj = datetime.strptime("2022-10-08", "%Y-%m-%d")
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
+        
+        total_games_processed = games_processed
+        chunk_size = 3  # Process 3 days at a time
+        
+        # Process in chunks
+        current_start = start_date_obj
+        while current_start <= end_date_obj:
+            current_end = min(current_start + timedelta(days=chunk_size-1), end_date_obj)
+            
+            chunk_start = current_start.strftime("%Y-%m-%d")
+            chunk_end = current_end.strftime("%Y-%m-%d")
+            
+            logger.info(f"Processing games from {chunk_start} to {chunk_end}...")
+            games_processed = collector.process_completed_games(chunk_start, chunk_end)
+            total_games_processed += games_processed
+            
+            # Move to next chunk
+            current_start = current_end + timedelta(days=1)
+    else:
+        logger.warning("No games processed on test day. Stopping.")
+        total_games_processed = 0
+    
+    logger.info(f"Total historical games processed: {total_games_processed}")
+    return total_games_processed
+
 def update_data(conn, start_date=None, end_date=None):
     """Update data from NHL API"""
     collector = NHLDataCollector(conn)
@@ -87,7 +139,7 @@ def make_predictions(conn, start_date=None, end_date=None):
     collector = NHLDataCollector(conn)
     model = GoalScorerModel(conn)
     
-    # Set date range if not provided
+    # Set date range if not provided - use current date range for predictions
     if start_date is None:
         start_date = datetime.now().strftime('%Y-%m-%d')
     if end_date is None:
@@ -282,6 +334,8 @@ def main():
     """Main execution function"""
     parser = argparse.ArgumentParser(description='NHL Goal Scorer Prediction System')
     parser.add_argument('--update', action='store_true', help='Update data from NHL API')
+    parser.add_argument('--historical', action='store_true', help='Update historical data from a previous season')
+    parser.add_argument('--season', type=str, default='20222023', help='Season for historical data (format: YYYYYYYY)')
     parser.add_argument('--train', action='store_true', help='Train the prediction model')
     parser.add_argument('--force-retrain', action='store_true', help='Force retrain even if model exists')
     parser.add_argument('--predict', action='store_true', help='Make predictions for upcoming games')
@@ -293,9 +347,9 @@ def main():
     
     args = parser.parse_args()
     
-    # Default behavior if no arguments provided
-    if not (args.update or args.train or args.predict or args.evaluate):
-        args.update = True
+    # Default behavior if no arguments provided - use historical for first run
+    if not (args.update or args.historical or args.train or args.predict or args.evaluate):
+        args.historical = True
         args.train = True
         args.predict = True
     
@@ -303,8 +357,11 @@ def main():
     conn = initialize_system()
     
     try:
+        # Update historical data - this takes precedence if both update flags are set
+        if args.historical:
+            update_historical_data(conn, args.season)
         # Update data
-        if args.update:
+        elif args.update:
             update_data(conn, args.start_date, args.end_date)
         
         # Train model
