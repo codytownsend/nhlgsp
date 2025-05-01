@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 class NHLDataCollector:
     def __init__(self, db_connection):
-        # The NHL API now uses these base URLs
+        # The NHL API base URLs
         self.web_base_url = "https://api-web.nhle.com/v1"
         self.stats_base_url = "https://api.nhle.com/stats/rest/en"
         self.db_connection = db_connection
@@ -37,12 +37,7 @@ class NHLDataCollector:
             try:
                 response = requests.get(url, params=params, headers=headers, timeout=10)
                 response.raise_for_status()
-                
-                # Log the first part of the response to see what we're getting
-                response_json = response.json()
-                logger.info(f"API response from {url}: {str(response_json)[:200]}...")
-                
-                return response_json
+                return response.json()
             except requests.exceptions.RequestException as e:
                 logger.warning(f"API request failed: {e}")
                 retries += 1
@@ -56,22 +51,33 @@ class NHLDataCollector:
     
     def get_teams(self):
         """Get all NHL teams"""
-        logger.info("Fetching teams data")
         try:
-            # There's no direct teams endpoint in the new API, so we'll use the standings
-            # which includes all teams
+            # Try using the standings endpoint to get team information
             url = f"{self.web_base_url}/standings/now"
             standings_data = self._make_api_request(url)
             
             # Extract team information from standings
             teams_data = {"teams": []}
-            for standing in standings_data.get('standings', []):
-                team = {
-                    'id': standing.get('teamAbbrev', {}).get('id'),
-                    'name': standing.get('teamName', {}).get('default'),
-                    'abbrev': standing.get('teamAbbrev', {}).get('default')
-                }
-                teams_data["teams"].append(team)
+            if 'standings' in standings_data:
+                for standing in standings_data.get('standings', []):
+                    team = {
+                        'id': standing.get('teamAbbrev', {}).get('id'),
+                        'name': standing.get('teamName', {}).get('default'),
+                        'abbrev': standing.get('teamAbbrev', {}).get('default')
+                    }
+                    teams_data["teams"].append(team)
+            
+            # If we didn't get teams from standings, try the team endpoint
+            if not teams_data["teams"]:
+                url = f"{self.stats_base_url}/team"
+                team_data = self._make_api_request(url)
+                if 'data' in team_data:
+                    for team in team_data['data']:
+                        teams_data["teams"].append({
+                            'id': team.get('id'),
+                            'name': team.get('fullName'),
+                            'abbrev': team.get('triCode')
+                        })
             
             return teams_data
         except Exception as e:
@@ -81,7 +87,6 @@ class NHLDataCollector:
         
     def get_schedule(self, start_date, end_date):
         """Get NHL schedule between two dates"""
-        logger.info(f"Fetching schedule from {start_date} to {end_date}")
         try:
             # For historical data, attempt to fetch each date individually
             start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
@@ -102,8 +107,6 @@ class NHLDataCollector:
                     for day in daily_data["gameWeek"]:
                         # Check if this day entry has games
                         if "games" in day and day["games"]:
-                            # Log what we found
-                            logger.info(f"Found {len(day['games'])} games for date {day.get('date')}")
                             # Add all games from this day
                             combined_data["games"].extend(day["games"])
                 
@@ -119,25 +122,26 @@ class NHLDataCollector:
     
     def get_game_data(self, game_id):
         """Get detailed data for a specific game"""
-        logger.info(f"Fetching data for game {game_id}")
         url = f"{self.web_base_url}/gamecenter/{game_id}/landing"
         return self._make_api_request(url)
     
     def get_game_boxscore(self, game_id):
         """Get boxscore data for a specific game"""
-        logger.info(f"Fetching boxscore for game {game_id}")
         url = f"{self.web_base_url}/gamecenter/{game_id}/boxscore"
+        return self._make_api_request(url)
+    
+    def get_game_feed(self, game_id):
+        """Get game feed data which includes play-by-play"""
+        url = f"{self.web_base_url}/gamecenter/{game_id}/play-by-play"
         return self._make_api_request(url)
     
     def get_player_stats(self, player_id, season=None):
         """Get stats for a specific player"""
-        logger.info(f"Fetching stats for player {player_id}")
         url = f"{self.web_base_url}/player/{player_id}/landing"
         return self._make_api_request(url)
     
     def update_teams(self):
         """Update teams in the database"""
-        logger.info("Updating teams in database")
         try:
             # Extract teams from standings data
             teams_data = self.get_teams()
@@ -145,30 +149,28 @@ class NHLDataCollector:
             
             team_count = 0
             
-            # Process standings to extract team data
-            if 'standings' in teams_data:
-                for standing in teams_data['standings']:
-                    team_abbrev = standing.get('teamAbbrev', {})
-                    team_id = team_abbrev.get('id')
-                    name = standing.get('teamName', {}).get('default')
-                    abbreviation = team_abbrev.get('default')
-                    
-                    if not team_id or not name:
-                        continue
-                    
-                    # Check if team exists
-                    cursor.execute("SELECT 1 FROM teams WHERE team_id = ?", (team_id,))
-                    if not cursor.fetchone():
-                        cursor.execute(
-                            "INSERT INTO teams (team_id, name, abbreviation, last_updated) VALUES (?, ?, ?, ?)",
-                            (team_id, name, abbreviation, datetime.now())
-                        )
-                    else:
-                        cursor.execute(
-                            "UPDATE teams SET name = ?, abbreviation = ?, last_updated = ? WHERE team_id = ?",
-                            (name, abbreviation, datetime.now(), team_id)
-                        )
-                    team_count += 1
+            # Process teams data
+            for team in teams_data.get('teams', []):
+                team_id = team.get('id')
+                name = team.get('name')
+                abbreviation = team.get('abbrev')
+                
+                if not team_id or not name:
+                    continue
+                
+                # Check if team exists
+                cursor.execute("SELECT 1 FROM teams WHERE team_id = ?", (team_id,))
+                if not cursor.fetchone():
+                    cursor.execute(
+                        "INSERT INTO teams (team_id, name, abbreviation, last_updated) VALUES (?, ?, ?, ?)",
+                        (team_id, name, abbreviation, datetime.now())
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE teams SET name = ?, abbreviation = ?, last_updated = ? WHERE team_id = ?",
+                        (name, abbreviation, datetime.now(), team_id)
+                    )
+                team_count += 1
             
             self.db_connection.commit()
             logger.info(f"Updated {team_count} teams")
@@ -186,9 +188,6 @@ class NHLDataCollector:
             schedule = self.get_schedule(start_date, end_date)
             cursor = self.db_connection.cursor()
             games_processed = 0
-            
-            # Debug output
-            logger.info(f"Found {len(schedule.get('games', []))} games in schedule")
             
             for game in schedule.get('games', []):
                 game_id = game.get('id')
@@ -231,7 +230,6 @@ class NHLDataCollector:
                     
                     # Skip if already processed as Final
                     if result and result[0] == 'Final':
-                        logger.info(f"Game {game_id} already processed, skipping")
                         continue
                     
                     # Get scores
@@ -253,13 +251,12 @@ class NHLDataCollector:
                         
                         # Process player stats
                         if boxscore_data:
-                            self._process_game_player_stats(game_id, boxscore_data)
+                            self._process_game_player_stats(game_id, boxscore_data, home_team_id, away_team_id)
                             
                             # Update any predictions with actual results
                             self._update_predictions_results(game_id)
                             
                             games_processed += 1
-                            logger.info(f"Processed game {game_id}: {home_score}-{away_score}")
                         else:
                             logger.warning(f"No boxscore data available for game {game_id}")
                     except Exception as e:
@@ -274,7 +271,7 @@ class NHLDataCollector:
             logger.error(f"Error in process_completed_games: {e}")
             return 0
     
-    def _process_game_player_stats(self, game_id, boxscore_data):
+    def _process_game_player_stats(self, game_id, boxscore_data, home_team_id, away_team_id):
         """Process player stats from a game and update database"""
         cursor = self.db_connection.cursor()
         
@@ -283,67 +280,214 @@ class NHLDataCollector:
             if not boxscore_data:
                 logger.warning(f"Empty boxscore data for game {game_id}")
                 return False
-                
-            # Debug output
-            logger.info(f"Processing boxscore data for game {game_id}")
-            logger.info(f"Boxscore keys: {list(boxscore_data.keys())[:10]}...")
             
-            # Get team IDs
-            home_team_id = boxscore_data.get('homeTeam', {}).get('id')
-            away_team_id = boxscore_data.get('awayTeam', {}).get('id')
+            # Get player stats from playerByGameStats key
+            player_stats = boxscore_data.get('playerByGameStats', {})
             
-            if not home_team_id or not away_team_id:
-                # Try to get team IDs from database
-                cursor.execute("SELECT home_team_id, away_team_id FROM games WHERE game_id = ?", (game_id,))
-                result = cursor.fetchone()
-                if result:
-                    home_team_id, away_team_id = result
+            if not player_stats:
+                # Try alternate method: check if we can get player info from summary > scoring
+                if 'summary' in boxscore_data and 'scoring' in boxscore_data['summary']:
+                    return self._process_player_stats_from_summary(game_id, boxscore_data, home_team_id, away_team_id, cursor)
                 else:
-                    logger.warning(f"Could not determine team IDs for game {game_id}")
-                    return False
+                    # Try getting from play-by-play data
+                    pbp_data = self.get_game_feed(game_id)
+                    if 'rosterSpots' in pbp_data:
+                        return self._process_player_stats_from_pbp(game_id, pbp_data, home_team_id, away_team_id, cursor)
+                    else:
+                        logger.warning(f"No player stats found for game {game_id}")
+                        return False
             
-            # Process home team players
-            home_forwards = boxscore_data.get('homeTeam', {}).get('forwards', [])
-            home_defense = boxscore_data.get('homeTeam', {}).get('defense', [])
-            home_goalies = boxscore_data.get('homeTeam', {}).get('goalies', [])
-            
-            # Process all home team players
-            for player in home_forwards + home_defense + home_goalies:
-                self._process_player_stats(game_id, player, home_team_id, cursor)
-            
-            # Process away team players
-            away_forwards = boxscore_data.get('awayTeam', {}).get('forwards', [])
-            away_defense = boxscore_data.get('awayTeam', {}).get('defense', [])
-            away_goalies = boxscore_data.get('awayTeam', {}).get('goalies', [])
-            
-            # Process all away team players
-            for player in away_forwards + away_defense + away_goalies:
-                self._process_player_stats(game_id, player, away_team_id, cursor)
+            # Process each player's stats
+            for player_id, player_data in player_stats.items():
+                # Skip any non-player entries
+                if not isinstance(player_data, dict) or 'playerId' not in player_data:
+                    continue
+                
+                # Determine team ID
+                team_id = player_data.get('teamId')
+                if not team_id:
+                    continue
+                
+                # Process player stats
+                self._process_player_stats(game_id, player_data, team_id, cursor)
             
             return True
         except Exception as e:
             logger.error(f"Error processing player stats for game {game_id}: {e}")
             return False
     
+    def _process_player_stats_from_summary(self, game_id, boxscore_data, home_team_id, away_team_id, cursor):
+        """Extract player stats from scoring summary"""
+        try:
+            # Get players who scored goals
+            goal_scorers = []
+            
+            # Go through scoring summary by period
+            for period in boxscore_data.get('summary', {}).get('scoring', []):
+                for goal in period.get('goals', []):
+                    # Get goal scorer info
+                    scorer_id = goal.get('scoredBy', {}).get('playerId')
+                    if not scorer_id:
+                        continue
+                    
+                    # Determine team
+                    team_id = goal.get('teamId')
+                    if not team_id:
+                        continue
+                    
+                    # Create minimal player record for scorer
+                    first_name = goal.get('scoredBy', {}).get('firstName', {}).get('default', '')
+                    last_name = goal.get('scoredBy', {}).get('lastName', {}).get('default', '')
+                    name = f"{first_name} {last_name}" if first_name and last_name else f"Player {scorer_id}"
+                    
+                    # Add to database
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO players (player_id, name, team_id, position, active, last_updated) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (scorer_id, name, team_id, "F", 1, datetime.now())
+                    )
+                    
+                    # Add to game stats
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO player_game_stats "
+                        "(player_id, game_id, team_id, position, scored_goal, goals, assists, "
+                        "shots, time_on_ice, pp_goals, sh_goals, last_updated) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (scorer_id, game_id, team_id, "F", 1, 1, 0, 0, 0, 0, 0, datetime.now())
+                    )
+                    
+                    goal_scorers.append(scorer_id)
+                    
+                    # Process assists
+                    for assist in goal.get('assists', []):
+                        player_id = assist.get('playerId')
+                        if not player_id:
+                            continue
+                        
+                        # Create minimal player record for assist
+                        first_name = assist.get('firstName', {}).get('default', '')
+                        last_name = assist.get('lastName', {}).get('default', '')
+                        name = f"{first_name} {last_name}" if first_name and last_name else f"Player {player_id}"
+                        
+                        # Add to database
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO players (player_id, name, team_id, position, active, last_updated) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (player_id, name, team_id, "F", 1, datetime.now())
+                        )
+                        
+                        # Add to game stats
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO player_game_stats "
+                            "(player_id, game_id, team_id, position, scored_goal, goals, assists, "
+                            "shots, time_on_ice, pp_goals, sh_goals, last_updated) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (player_id, game_id, team_id, "F", 0, 0, 1, 0, 0, 0, 0, datetime.now())
+                        )
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error processing summary stats for game {game_id}: {e}")
+            return False
+    
+    def _process_player_stats_from_pbp(self, game_id, pbp_data, home_team_id, away_team_id, cursor):
+        """Extract player stats from play-by-play data"""
+        try:
+            # Get all players from rosterSpots
+            roster_spots = pbp_data.get('rosterSpots', {})
+            
+            # Process each player
+            for player_id, player_data in roster_spots.items():
+                team_id = player_data.get('teamId')
+                if not team_id:
+                    continue
+                
+                # Get player name and position
+                first_name = player_data.get('firstName', {}).get('default', '')
+                last_name = player_data.get('lastName', {}).get('default', '')
+                name = f"{first_name} {last_name}" if first_name and last_name else f"Player {player_id}"
+                position = player_data.get('positionCode', '')
+                
+                # Add player to database
+                cursor.execute(
+                    "INSERT OR REPLACE INTO players (player_id, name, team_id, position, active, last_updated) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (player_id, name, team_id, position, 1, datetime.now())
+                )
+                
+                # Default values
+                scored_goal = 0
+                goals = 0
+                assists = 0
+                
+                # Look for scoring plays by this player
+                for play in pbp_data.get('plays', []):
+                    if play.get('typeCode') == 'GOAL':
+                        # Check if this player scored
+                        if play.get('details', {}).get('scoringPlayerId') == player_id:
+                            scored_goal = 1
+                            goals += 1
+                        
+                        # Check for assists
+                        for assist_key in ['assist1PlayerId', 'assist2PlayerId']:
+                            if play.get('details', {}).get(assist_key) == player_id:
+                                assists += 1
+                
+                # Add to game stats
+                cursor.execute(
+                    "INSERT OR REPLACE INTO player_game_stats "
+                    "(player_id, game_id, team_id, position, scored_goal, goals, assists, "
+                    "shots, time_on_ice, pp_goals, sh_goals, last_updated) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (player_id, game_id, team_id, position, scored_goal, goals, assists, 0, 0, 0, 0, datetime.now())
+                )
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error processing play-by-play stats for game {game_id}: {e}")
+            return False
+    
     def _process_player_stats(self, game_id, player, team_id, cursor):
         """Process stats for a single player"""
         try:
-            player_id = player.get('playerId')
+            # Get player ID - might be under playerId or id
+            player_id = player.get('playerId') or player.get('id')
             if not player_id:
                 return
                 
-            # Get player name - either from firstName/lastName or just name
-            first_name = player.get('firstName', {}).get('default', '')
-            last_name = player.get('lastName', {}).get('default', '')
+            # Get player name components
+            first_name = ''
+            last_name = ''
+            
+            # Check for firstName/lastName objects
+            if 'firstName' in player:
+                if isinstance(player['firstName'], dict):
+                    first_name = player['firstName'].get('default', '')
+                else:
+                    first_name = str(player['firstName'])
+                    
+            if 'lastName' in player:
+                if isinstance(player['lastName'], dict):
+                    last_name = player['lastName'].get('default', '')
+                else:
+                    last_name = str(player['lastName'])
             
             # If we have both first and last name, combine them
             if first_name and last_name:
                 player_name = f"{first_name} {last_name}"
-            # Otherwise try the name field directly
+            # Try the name field directly (may be an object or string)
+            elif 'name' in player:
+                if isinstance(player['name'], dict):
+                    player_name = player['name'].get('default', f"Player {player_id}")
+                else:
+                    player_name = str(player['name'])
             else:
-                player_name = player.get('name', {}).get('default', f"Player {player_id}")
+                player_name = f"Player {player_id}"
                 
-            position = player.get('positionCode')
+            # Get position - also has several possible formats
+            position = player.get('positionCode') or player.get('position')
+            if isinstance(position, dict):
+                position = position.get('code') or position.get('abbreviation', '')
             
             # Update player in database
             cursor.execute(
@@ -352,17 +496,28 @@ class NHLDataCollector:
                 (player_id, player_name, team_id, position, 1, datetime.now())
             )
             
-            # Get skater stats
-            skater_stats = player.get('skaterStats', {})
+            # Get skater stats - try different possible formats
+            skater_stats = player.get('skaterStats') or player.get('stats') or {}
+            
             if skater_stats:
+                # Handle goals - may be under different keys
                 goals = skater_stats.get('goals', 0)
+                
+                # Handle assists - may be under different keys
                 assists = skater_stats.get('assists', 0)
+                
+                # Handle shots - may be under different keys
                 shots = skater_stats.get('shots', 0)
                 
-                # Convert time on ice to seconds
+                # Convert time on ice to seconds - check different formats
                 time_on_ice_str = skater_stats.get('timeOnIce', '0:00')
-                time_parts = time_on_ice_str.split(':')
-                time_on_ice = int(time_parts[0]) * 60 + int(time_parts[1]) if len(time_parts) >= 2 else 0
+                if isinstance(time_on_ice_str, int):
+                    # Some APIs return TOI in seconds directly
+                    time_on_ice = time_on_ice_str
+                else:
+                    # Parse time format "MM:SS"
+                    time_parts = str(time_on_ice_str).split(':')
+                    time_on_ice = int(time_parts[0]) * 60 + int(time_parts[1]) if len(time_parts) >= 2 else 0
                 
                 # Power play and shorthanded goals
                 pp_goals = skater_stats.get('powerPlayGoals', 0)
@@ -414,7 +569,6 @@ class NHLDataCollector:
                 )
             
             self.db_connection.commit()
-            logger.info(f"Updated prediction results for game {game_id}")
             return True
         except Exception as e:
             self.db_connection.rollback()
@@ -423,7 +577,6 @@ class NHLDataCollector:
     
     def get_upcoming_games(self, start_date, end_date):
         """Get list of upcoming games"""
-        logger.info(f"Finding upcoming games from {start_date} to {end_date}")
         try:
             schedule = self.get_schedule(start_date, end_date)
             cursor = self.db_connection.cursor()

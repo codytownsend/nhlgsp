@@ -43,9 +43,14 @@ def update_historical_data(conn, season="20222023"):
     """Update historical data from a specific NHL season"""
     collector = NHLDataCollector(conn)
     
-    # Set date range for the 2022-2023 NHL regular season
-    start_date = "2022-10-07"  # Start of 2022-2023 season
-    end_date = "2023-04-13"    # End of 2022-2023 regular season
+    # Dynamically determine season dates from the season string
+    season_start_year = int(season[:4])
+    season_end_year = int(season[4:])
+    
+    # NHL regular seasons typically start in early October and end in mid-April
+    # Use approximate date range based on the pattern
+    start_date = f"{season_start_year}-10-01"
+    end_date = f"{season_end_year}-04-15"
     
     logger.info(f"Updating historical data from {start_date} to {end_date} (Season: {season})")
     
@@ -53,10 +58,50 @@ def update_historical_data(conn, season="20222023"):
     logger.info("Updating teams...")
     collector.update_teams()
     
-    # Process a very short initial period for testing (just one day)
-    test_start = "2022-10-07"
-    test_end = "2022-10-07"
+    # First, try to find the actual first game date by querying a date range
+    # This will help us find the real season start date
+    test_start = f"{season_start_year}-09-15"  # Start checking from mid-September
+    test_end = f"{season_start_year}-10-31"    # Check until end of October
     
+    logger.info(f"Determining actual season start date by checking games from {test_start} to {test_end}")
+    test_schedule = collector.get_schedule(test_start, test_end)
+    
+    # Find the earliest regular season game
+    earliest_date = None
+    for game in test_schedule.get('games', []):
+        if game.get('gameType') == 2:  # Regular season games have gameType 2
+            game_date = game.get('gameDate')
+            if game_date and (earliest_date is None or game_date < earliest_date):
+                earliest_date = game_date
+    
+    if earliest_date:
+        start_date = earliest_date
+        logger.info(f"Found actual season start date: {start_date}")
+    
+    # Similarly, find the actual end date
+    test_start = f"{season_end_year}-04-01"  # Start checking from early April
+    test_end = f"{season_end_year}-05-15"    # Check until mid-May
+    
+    logger.info(f"Determining actual season end date by checking games from {test_start} to {test_end}")
+    test_schedule = collector.get_schedule(test_start, test_end)
+    
+    # Find the latest regular season game
+    latest_date = None
+    for game in test_schedule.get('games', []):
+        if game.get('gameType') == 2:  # Regular season games
+            game_date = game.get('gameDate')
+            if game_date and (latest_date is None or game_date > latest_date):
+                latest_date = game_date
+    
+    if latest_date:
+        end_date = latest_date
+        logger.info(f"Found actual season end date: {end_date}")
+    
+    # Process a very short initial period for testing (just one day)
+    test_start = start_date
+    test_end = start_date
+    
+    # Rest of the function remains the same as before
     logger.info(f"Processing test day: {test_start}")
     games_processed = collector.process_completed_games(test_start, test_end)
     
@@ -64,7 +109,7 @@ def update_historical_data(conn, season="20222023"):
         logger.info(f"Successfully processed {games_processed} games on test day!")
         
         # If successful, process the rest in 3-day chunks
-        start_date_obj = datetime.strptime("2022-10-08", "%Y-%m-%d")
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d") + timedelta(days=1)
         end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
         
         total_games_processed = games_processed
