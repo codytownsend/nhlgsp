@@ -530,7 +530,7 @@ class NHLDataCollector:
             return False
     
     def get_upcoming_games(self, start_date, end_date):
-        """Get list of upcoming games"""
+        """Get list of upcoming games with improved team name handling"""
         try:
             schedule = self.get_schedule(start_date, end_date)
             cursor = self.db_connection.cursor()
@@ -538,7 +538,7 @@ class NHLDataCollector:
             
             for game in schedule.get('games', []):
                 game_id = game.get('id')
-                game_date = game.get('startTimeUTC', '').split('T')[0]  # Extract date part
+                game_date = game.get('gameDate', '').split('T')[0] if 'gameDate' in game else game.get('startTimeUTC', '').split('T')[0]
                 game_state = game.get('gameState')
                 
                 # Only include upcoming games
@@ -546,14 +546,14 @@ class NHLDataCollector:
                     home_team_id = game.get('homeTeam', {}).get('id')
                     away_team_id = game.get('awayTeam', {}).get('id')
                     
-                    # Get team names
-                    cursor.execute("SELECT name FROM teams WHERE team_id = ?", (home_team_id,))
-                    home_team_result = cursor.fetchone()
-                    home_team = home_team_result[0] if home_team_result else game.get('homeTeam', {}).get('name', {}).get('default', "Unknown")
+                    # Ensure team IDs are valid
+                    if not home_team_id or not away_team_id:
+                        logger.warning(f"Invalid team IDs for game {game_id}")
+                        continue
                     
-                    cursor.execute("SELECT name FROM teams WHERE team_id = ?", (away_team_id,))
-                    away_team_result = cursor.fetchone()
-                    away_team = away_team_result[0] if away_team_result else game.get('awayTeam', {}).get('name', {}).get('default', "Unknown")
+                    # Get team names using our helper method
+                    home_team = self._get_team_name(home_team_id)
+                    away_team = self._get_team_name(away_team_id)
                     
                     game_info = {
                         'game_id': game_id,
@@ -571,8 +571,12 @@ class NHLDataCollector:
                         "(game_id, season, game_date, home_team_id, away_team_id, status, last_updated) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (game_id, game.get('season', ''), game_date, home_team_id, away_team_id, 
-                         game_state, datetime.now())
+                        game_state, datetime.now())
                     )
+                    
+                    # Also update team names in the teams table
+                    self._update_team_in_database(home_team_id, home_team)
+                    self._update_team_in_database(away_team_id, away_team)
                     
                     upcoming_games.append(game_info)
             
@@ -582,3 +586,51 @@ class NHLDataCollector:
             self.db_connection.rollback()
             logger.error(f"Error getting upcoming games: {e}")
             return []
+
+    def _update_team_in_database(self, team_id, team_name):
+        """Helper method to update team name in database"""
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO teams (team_id, name, last_updated) "
+                "VALUES (?, ?, ?)",
+                (team_id, team_name, datetime.now())
+            )
+        except Exception as e:
+            logger.error(f"Error updating team in database: {e}")
+
+    def _get_team_name(self, team_id, default_name=None):
+        """Get team name from NHL_TEAM_NAMES mapping or database with fallback"""
+        try:
+            # First try to get from our mapping
+            from config import NHL_TEAM_NAMES
+            if team_id in NHL_TEAM_NAMES:
+                team_name = NHL_TEAM_NAMES[team_id]
+                
+                # Update database with this name
+                cursor = self.db_connection.cursor()
+                cursor.execute(
+                    "UPDATE teams SET name = ? WHERE team_id = ?",
+                    (team_name, team_id)
+                )
+                self.db_connection.commit()
+                return team_name
+            
+            # If not in mapping, try database
+            cursor = self.db_connection.cursor()
+            cursor.execute("SELECT name FROM teams WHERE team_id = ?", (team_id,))
+            result = cursor.fetchone()
+            
+            if result and result[0] and not result[0].startswith('Team '):
+                return result[0]
+            
+            # Return a fallback name if nothing else worked
+            if default_name and not default_name.startswith('Team '):
+                return default_name
+            
+            # Last resort
+            return f"NHL Team {team_id}"
+        
+        except Exception as e:
+            logger.error(f"Error getting team name for ID {team_id}: {e}")
+            return default_name if default_name else f"NHL Team {team_id}"

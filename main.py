@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import logging
+import numpy as np
 import argparse
 import os
 from datetime import datetime, timedelta
@@ -175,7 +176,7 @@ def make_predictions(conn, start_date=None, end_date=None):
     collector = NHLDataCollector(conn)
     model = GoalScorerModel(conn)
     
-    # Set date range if not provided - use current date range for predictions
+    # Set date range if not provided
     if start_date is None:
         start_date = datetime.now().strftime('%Y-%m-%d')
     if end_date is None:
@@ -190,11 +191,18 @@ def make_predictions(conn, start_date=None, end_date=None):
         logger.warning(f"No upcoming games found for date range {start_date} to {end_date}")
         return []
     
+    # Track games we've already processed to avoid duplicates
+    processed_game_ids = set()
     all_predictions = []
     
     # Make predictions for each game
     for game in upcoming_games:
         game_id = game['game_id']
+        
+        # Skip if we've already processed this game
+        if game_id in processed_game_ids:
+            continue
+        
         logger.info(f"Generating predictions for {game['home_team']} vs {game['away_team']} (ID: {game_id})")
         
         predictions = model.predict_game(game_id)
@@ -207,6 +215,9 @@ def make_predictions(conn, start_date=None, end_date=None):
                 'predictions': predictions
             }
             all_predictions.append(game_predictions)
+            
+            # Mark this game as processed
+            processed_game_ids.add(game_id)
     
     return all_predictions
 
@@ -281,7 +292,7 @@ def export_predictions_to_json(predictions, filename=None):
         return False
 
 def evaluate_predictions(conn, days_ago=1):
-    """Evaluate prediction accuracy for games from a specified number of days ago"""
+    """Evaluate prediction accuracy for games from a specified number of days ago with enhanced metrics"""
     logger.info(f"Evaluating predictions from {days_ago} days ago")
     
     target_date = (datetime.now() - timedelta(days=days_ago)).strftime('%Y-%m-%d')
@@ -308,6 +319,8 @@ def evaluate_predictions(conn, days_ago=1):
         
         overall_correct = 0
         overall_total = 0
+        all_probs = []
+        all_results = []
         
         for game_id, home_team, away_team in games:
             # Get top 10 predictions for this game
@@ -341,6 +354,11 @@ def evaluate_predictions(conn, days_ago=1):
             for _, name, prob, scored in predictions:
                 status = "✓" if scored else "✗"
                 print(f"{status} {name} - {prob*100:.1f}%")
+                
+                # Collect for metrics
+                all_probs.append(prob)
+                all_results.append(1 if scored else 0)
+                
                 if scored:
                     correct_predictions += 1
             
@@ -352,7 +370,40 @@ def evaluate_predictions(conn, days_ago=1):
         if overall_total > 0:
             accuracy = overall_correct/overall_total * 100
             print(f"\nOverall accuracy: {overall_correct}/{overall_total} ({accuracy:.1f}%)")
-        
+            
+            # Calculate additional metrics
+            from sklearn.metrics import brier_score_loss, roc_auc_score
+            
+            if len(all_probs) > 0:
+                # Brier score (lower is better)
+                brier = brier_score_loss(all_results, all_probs)
+                print(f"Brier score: {brier:.4f} (lower is better)")
+                
+                # ROC AUC if we have both positive and negative cases
+                if len(set(all_results)) > 1:
+                    roc_auc = roc_auc_score(all_results, all_probs)
+                    print(f"ROC AUC: {roc_auc:.4f} (higher is better)")
+                
+                # Calculate calibration
+                from sklearn.calibration import calibration_curve
+                
+                try:
+                    # Calibration for 5 bins
+                    prob_true, prob_pred = calibration_curve(all_results, all_probs, n_bins=5)
+                    
+                    print("\nCalibration analysis (reliability):")
+                    print("Probability bin  |  Expected rate  |  Observed rate  |  Difference")
+                    print("-" * 65)
+                    
+                    bin_edges = np.linspace(0, 1, 6)
+                    for i, (true_prob, pred_prob) in enumerate(zip(prob_true, prob_pred)):
+                        bin_start = bin_edges[i]
+                        bin_end = bin_edges[i+1]
+                        bin_center = (bin_start + bin_end) / 2
+                        print(f"{bin_start*100:5.1f}%-{bin_end*100:5.1f}% |       {bin_center*100:5.1f}%    |      {true_prob*100:5.1f}%    |    {(true_prob-bin_center)*100:+5.1f}%")
+                except Exception as e:
+                    print(f"Could not calculate calibration: {e}")
+            
             # Store evaluation metrics
             cursor.execute(
                 "INSERT INTO prediction_evaluation "
