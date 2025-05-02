@@ -26,6 +26,15 @@ def calculate_advanced_metrics(conn):
         # Calculate shooting metrics
         calculate_shooting_metrics(conn)
         
+        # Calculate team-relative metrics
+        calculate_relative_metrics(conn)
+        
+        # Calculate team defensive metrics
+        calculate_team_defensive_metrics(conn)
+        
+        # Calculate opponent-specific metrics
+        calculate_opponent_metrics(conn)
+        
         logger.info("Advanced metrics calculation complete")
     except Exception as e:
         logger.error(f"Error in calculate_advanced_metrics: {e}")
@@ -78,6 +87,51 @@ def ensure_correct_tables_schema(conn):
             exponentially_weighted_goals REAL,
             goal_momentum REAL,
             last_updated TIMESTAMP
+        )
+        ''')
+        
+        # Create player_relative_metrics table
+        cursor.execute("DROP TABLE IF EXISTS player_relative_metrics")
+        
+        cursor.execute('''
+        CREATE TABLE player_relative_metrics (
+            player_id INTEGER PRIMARY KEY,
+            goals_relative_to_team REAL,
+            shots_relative_to_team REAL,
+            shooting_efficiency_relative REAL,
+            last_updated TIMESTAMP,
+            FOREIGN KEY (player_id) REFERENCES players (player_id)
+        )
+        ''')
+        
+        # Create player_opponent_metrics table
+        cursor.execute("DROP TABLE IF EXISTS player_opponent_metrics")
+        
+        cursor.execute('''
+        CREATE TABLE player_opponent_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER,
+            opponent_team_id INTEGER,
+            gpg_vs_opponent REAL,
+            opponent_strength REAL,
+            last_updated TIMESTAMP,
+            FOREIGN KEY (player_id) REFERENCES players (player_id),
+            FOREIGN KEY (opponent_team_id) REFERENCES teams (team_id),
+            UNIQUE(player_id, opponent_team_id)
+        )
+        ''')
+        
+        # Create team_defensive_metrics table
+        cursor.execute("DROP TABLE IF EXISTS team_defensive_metrics")
+        
+        cursor.execute('''
+        CREATE TABLE team_defensive_metrics (
+            team_id INTEGER PRIMARY KEY,
+            defensive_strength REAL,
+            goals_against_per_game REAL,
+            shots_against_per_game REAL,
+            last_updated TIMESTAMP,
+            FOREIGN KEY (team_id) REFERENCES teams (team_id)
         )
         ''')
         
@@ -296,3 +350,233 @@ def calculate_shooting_metrics(conn):
     except Exception as e:
         conn.rollback()
         logger.error(f"Error calculating shooting metrics: {e}")
+
+def calculate_relative_metrics(conn):
+    """Calculate team-relative metrics for players"""
+    cursor = conn.cursor()
+    
+    try:
+        # Get all players
+        cursor.execute("SELECT DISTINCT player_id, team_id FROM players WHERE active = 1")
+        players = cursor.fetchall()
+        
+        # Process each player
+        for player_id, team_id in players:
+            try:
+                if not team_id:
+                    continue
+                    
+                # Get player's goal and shot stats
+                cursor.execute('''
+                SELECT SUM(goals), SUM(shots), COUNT(*)
+                FROM player_game_stats
+                WHERE player_id = ?
+                ''', (player_id,))
+                
+                player_stats = cursor.fetchone()
+                if not player_stats[0]:
+                    continue
+                    
+                player_goals, player_shots, player_games = player_stats
+                
+                # Get team average stats (excluding this player)
+                cursor.execute('''
+                SELECT AVG(goals), AVG(shots)
+                FROM player_game_stats pgs
+                JOIN players p ON pgs.player_id = p.player_id
+                WHERE p.team_id = ? AND p.player_id != ?
+                GROUP BY p.position
+                HAVING p.position = (SELECT position FROM players WHERE player_id = ?)
+                ''', (team_id, player_id, player_id))
+                
+                team_stats = cursor.fetchone()
+                if not team_stats:
+                    # Fallback to league averages if team stats not available
+                    if player_goals > 0 and player_shots > 0:
+                        goals_relative = 1.0
+                        shots_relative = 1.0
+                        efficiency_relative = 1.0
+                    else:
+                        goals_relative = 0.9
+                        shots_relative = 0.9
+                        efficiency_relative = 0.9
+                else:
+                    team_avg_goals, team_avg_shots = team_stats
+                    
+                    # Calculate relative metrics
+                    if team_avg_goals > 0 and player_games > 0:
+                        goals_relative = (player_goals / player_games) / team_avg_goals
+                    else:
+                        goals_relative = 1.0
+                        
+                    if team_avg_shots > 0 and player_games > 0:
+                        shots_relative = (player_shots / player_games) / team_avg_shots
+                    else:
+                        shots_relative = 1.0
+                    
+                    # Shooting efficiency relative to teammates
+                    if team_avg_shots > 0 and team_avg_goals > 0 and player_shots > 0:
+                        player_efficiency = player_goals / player_shots
+                        team_efficiency = team_avg_goals / team_avg_shots
+                        efficiency_relative = player_efficiency / team_efficiency if team_efficiency > 0 else 1.0
+                    else:
+                        efficiency_relative = 1.0
+                
+                # Insert into database
+                cursor.execute('''
+                INSERT OR REPLACE INTO player_relative_metrics
+                (player_id, goals_relative_to_team, shots_relative_to_team, 
+                 shooting_efficiency_relative, last_updated)
+                VALUES (?, ?, ?, ?, datetime('now'))
+                ''', (player_id, goals_relative, shots_relative, efficiency_relative))
+                
+            except Exception as e:
+                logger.error(f"Error calculating relative metrics for player {player_id}: {e}")
+                # Continue with next player
+                continue
+        
+        conn.commit()
+        logger.info("Relative metrics calculated successfully")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error calculating relative metrics: {e}")
+
+def calculate_team_defensive_metrics(conn):
+    """Calculate defensive metrics for each team"""
+    cursor = conn.cursor()
+    
+    try:
+        # Get all teams
+        cursor.execute("SELECT team_id, name FROM teams")
+        teams = cursor.fetchall()
+        
+        for team_id, team_name in teams:
+            try:
+                # Calculate goals against per game
+                cursor.execute('''
+                SELECT AVG(
+                    CASE 
+                        WHEN g.home_team_id = ? THEN g.away_score
+                        WHEN g.away_team_id = ? THEN g.home_score
+                        ELSE NULL
+                    END
+                )
+                FROM games g
+                WHERE (g.home_team_id = ? OR g.away_team_id = ?) AND g.status = 'Final'
+                ''', (team_id, team_id, team_id, team_id))
+                
+                goals_against = cursor.fetchone()[0]
+                goals_against = goals_against if goals_against is not None else 3.0  # Default
+                
+                # Calculate shots against (approximate, as we may not have this directly)
+                # Using league average shot-to-goal ratio of about 10%
+                shots_against = goals_against * 10.0
+                
+                # Calculate defensive strength metric (lower goals against = higher strength)
+                # Center around 1.0 (higher = better defense)
+                defensive_strength = 3.0 / goals_against if goals_against > 0 else 1.0
+                
+                # Insert into database
+                cursor.execute('''
+                INSERT OR REPLACE INTO team_defensive_metrics
+                (team_id, defensive_strength, goals_against_per_game, 
+                 shots_against_per_game, last_updated)
+                VALUES (?, ?, ?, ?, datetime('now'))
+                ''', (team_id, defensive_strength, goals_against, shots_against))
+                
+            except Exception as e:
+                logger.error(f"Error calculating defensive metrics for team {team_id}: {e}")
+                # Continue with next team
+                continue
+        
+        conn.commit()
+        logger.info("Team defensive metrics calculated successfully")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error calculating team defensive metrics: {e}")
+
+def calculate_opponent_metrics(conn):
+    """Calculate player performance metrics against specific opponents"""
+    cursor = conn.cursor()
+    
+    try:
+        # Get all active players
+        cursor.execute("SELECT player_id FROM players WHERE active = 1")
+        players = cursor.fetchall()
+        
+        # Get all teams
+        cursor.execute("SELECT team_id FROM teams")
+        teams = cursor.fetchall()
+        
+        # For each player, calculate metrics against each opponent
+        for player_id, in players:
+            player_metrics = {}
+            
+            # Get overall career goals per game for baseline
+            cursor.execute('''
+            SELECT COUNT(*) AS games, SUM(scored_goal) AS goals
+            FROM player_game_stats
+            WHERE player_id = ?
+            ''', (player_id,))
+            
+            result = cursor.fetchone()
+            total_games, total_goals = result
+            
+            career_gpg = total_goals / total_games if total_games and total_games > 0 else 0.1
+            
+            # Process each opponent team
+            for team_id, in teams:
+                try:
+                    # Get defensive strength of opponent
+                    cursor.execute('''
+                    SELECT defensive_strength 
+                    FROM team_defensive_metrics
+                    WHERE team_id = ?
+                    ''', (team_id,))
+                    
+                    def_result = cursor.fetchone()
+                    defensive_strength = def_result[0] if def_result else 1.0
+                    
+                    # Get player's performance against this opponent
+                    cursor.execute('''
+                    SELECT COUNT(*) AS games, SUM(pgs.scored_goal) AS goals
+                    FROM player_game_stats pgs
+                    JOIN games g ON pgs.game_id = g.game_id
+                    WHERE pgs.player_id = ? AND 
+                          ((g.home_team_id = ? AND pgs.team_id != ?) OR
+                           (g.away_team_id = ? AND pgs.team_id != ?))
+                    ''', (player_id, team_id, team_id, team_id, team_id))
+                    
+                    opp_result = cursor.fetchone()
+                    
+                    if opp_result and opp_result[0] and opp_result[0] > 0:
+                        opp_games, opp_goals = opp_result
+                        gpg_vs_opponent = opp_goals / opp_games if opp_goals is not None else career_gpg
+                    else:
+                        # If no games against this opponent, use career average
+                        gpg_vs_opponent = career_gpg
+                    
+                    # Adjust for opponent strength (stronger opponents = more impressive performance)
+                    opponent_strength = 1.0 / defensive_strength if defensive_strength > 0 else 1.0
+                    
+                    # Insert into database
+                    cursor.execute('''
+                    INSERT OR REPLACE INTO player_opponent_metrics
+                    (player_id, opponent_team_id, gpg_vs_opponent, opponent_strength, last_updated)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    ''', (player_id, team_id, gpg_vs_opponent, opponent_strength))
+                
+                except Exception as e:
+                    logger.error(f"Error processing opponent metrics for player {player_id} vs team {team_id}: {e}")
+                    # Insert default values instead of continuing
+                    cursor.execute('''
+                    INSERT OR REPLACE INTO player_opponent_metrics
+                    (player_id, opponent_team_id, gpg_vs_opponent, opponent_strength, last_updated)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    ''', (player_id, team_id, career_gpg, 1.0))
+        
+        conn.commit()
+        logger.info("Opponent metrics calculated successfully")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error calculating opponent metrics: {e}")
